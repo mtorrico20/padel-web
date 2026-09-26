@@ -781,6 +781,23 @@ a {
   color: #2563eb;
 }
 
+@media (max-width: 600px) {
+  .results-table-wrapper {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .results-table {
+    min-width: 1050px;
+  }
+
+  .results-table th,
+  .results-table td {
+    overflow-wrap: normal;
+    white-space: nowrap;
+  }
+}
+
 .result-match-card {
   padding: 1rem;
 
