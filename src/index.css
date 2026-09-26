@@ -782,6 +782,13 @@ a {
 }
 
 @media (max-width: 600px) {
+  .results-sections,
+  .results-section,
+  .results-table-wrapper {
+    min-width: 0;
+    max-width: 100%;
+  }
+
   .results-table-wrapper {
     overflow-x: auto;
     overscroll-behavior-x: contain;
