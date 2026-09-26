@@ -1,0 +1,1176 @@
+/**
+ * LIGA DE PÁDEL - GOOGLE SHEETS + GOOGLE FORMS
+ *
+ * Hojas de datos:
+ * JUGADORES(ID_JUGADOR, NOMBRE, CORREO)
+ * TURNOS(ID_TURNO, TURNO)
+ * SOLICITUDES(ID_SOLICITUD, ID_JUGADOR, FECHA, ID_TURNO, FECHA_SOLICITUD, F_ANULACION)
+ * PARTIDOS(ID_PARTIDO, FECHA, ID_TURNO, ID_JUGADOR1..4, N_SET_J1..4, F_BORRADO)
+ * CLASIFICACION (calculada con fórmulas)
+ *
+ * FORMULARIO:
+ * - Acción: "Apuntarse" / "Darse de baja"
+ * - Fecha
+ * - Turno: "Mañana" / "Tarde"
+ * - Recopilar dirección de correo electrónico
+ *
+ * IMPORTANTE:
+ * 1) El administrador mantiene JUGADORES.
+ * 2) El formulario debe estar vinculado a este Spreadsheet.
+ * 3) Crear un disparador instalable para la función onFormSubmit.
+ */
+
+const CFG = {
+  SHEETS: {
+    JUGADORES: "JUGADORES",
+    TURNOS: "TURNOS",
+    SOLICITUDES: "SOLICITUDES",
+    PARTIDOS: "PARTIDOS",
+    TEMPORADAS: "TEMPORADAS",
+  },
+  FORM_FIELDS: {
+    ACCION: ["Acción", "Accion"],
+    FECHA: ["Fecha"],
+    TURNO: ["Turno"],
+    OBSERVACIONES: ["Observaciones"],
+  },
+};
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu("Pádel").addItem("Recalcular todos los partidos pendientes", "rebuildAllPending").addItem("Comprobar estructura", "checkStructure").addToUi();
+}
+
+/**
+ * Ejecutar una vez desde el editor para comprobar que las hojas existen.
+ */
+function checkStructure() {
+  const ss = SpreadsheetApp.getActive();
+  Object.values(CFG.SHEETS).forEach((name) => {
+    if (!ss.getSheetByName(name)) throw new Error("Falta la hoja: " + name);
+  });
+  SpreadsheetApp.getUi().alert("Estructura correcta.");
+}
+
+/**
+ * Disparador instalable: Spreadsheet -> On form submit.
+ */
+function onFormSubmit(e) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const data = getFormData_(e);
+    const email = String(data.email || "")
+      .trim()
+      .toLowerCase();
+    if (!email) throw new Error("No se ha recibido el correo del jugador.");
+
+    const player = findPlayerByEmail_(email);
+    if (!player) throw new Error("El correo no está autorizado en JUGADORES: " + email);
+
+    // console.log("player: " + player)
+
+    const fecha = normalizeDate_(data.fecha);
+    if (!fecha) throw new Error("Fecha no válida: " + data.fecha);
+
+    const turnoId = getTurnId_(data.turno);
+    if (!turnoId) throw new Error("Turno no válido: " + data.turno);
+
+    const accion = String(data.accion || "Apuntarse")
+      .trim()
+      .toLowerCase();
+
+    const observaciones = String(data.observaciones || "");
+
+    //console.log("observaciones: " + observaciones);
+
+    if (accion.includes("baja")) {
+      /*console.log("Baja: ");
+      console.log("---> player: " + player);
+      console.log("---> fecha: " + fecha);
+      console.log("---> turnoId: " + turnoId);*/
+
+      cancelRequest_(player, fecha, turnoId);
+    } else {
+      /*console.log("Alta: ");
+      console.log("---> player: " + player);
+      console.log("---> fecha: " + fecha);
+      console.log("---> turnoId: " + turnoId);*/
+
+      createRequestIfNeeded_(player, fecha, turnoId, observaciones);
+    }
+
+    rebuildPendingFor_(fecha, turnoId);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Procesa manualmente todos los días/turnos presentes en SOLICITUDES.
+ * Útil después de cargar datos iniciales o hacer una corrección manual.
+ */
+function rebuildAllPending() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName(CFG.SHEETS.SOLICITUDES);
+    const rows = getRows_(sh);
+    const keys = new Set();
+
+    rows.forEach((r) => {
+      if (!r.F_PARTIDO || !r.ID_JUGADOR || !r.ID_TURNO) return;
+      keys.add(key_(r.F_PARTIDO, r.ID_TURNO));
+    });
+
+    keys.forEach((k) => {
+      const [dateMs, turno] = k.split("|");
+      rebuildPendingFor_(new Date(Number(dateMs)), Number(turno));
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Recalcula los partidos PENDIENTES de una fecha+turno.
+ *
+ * No toca:
+ * - partidos jugados (los 4 N_SET informados)
+ * - partidos ya borrados
+ *
+ * Si la composición pendiente cambia:
+ * - marca los partidos pendientes actuales como borrados
+ * - crea nuevas filas con los grupos correctos de 4
+ */
+function rebuildPendingFor_(fecha, turnoId) {
+  const ss = SpreadsheetApp.getActive();
+  const shSol = ss.getSheetByName(CFG.SHEETS.SOLICITUDES);
+  const shPar = ss.getSheetByName(CFG.SHEETS.PARTIDOS);
+
+  /*console.log("rebuildPendingFor_");
+  console.log("fecha: " + fecha);
+  console.log("turnoId: " + turnoId);*/
+
+  const activePlayers = getActivePlayers_(shSol, fecha, turnoId);
+  const desiredGroups = [];
+
+  //console.log("activePlayers.length: " + activePlayers.length);
+
+  for (let i = 0; i + 3 < activePlayers.length; i += 4) {
+    //console.log("entra");
+    desiredGroups.push(activePlayers.slice(i, i + 4).map((x) => x.ID_JUGADOR));
+  }
+
+  const pending = getPendingMatches_(shPar, fecha, turnoId);
+
+  const currentGroups = pending.map((m) => [m.ID_JUGADOR1, m.ID_JUGADOR2, m.ID_JUGADOR3, m.ID_JUGADOR4]);
+
+  if (sameGroups_(currentGroups, desiredGroups)) return;
+
+  // Anular las versiones pendientes anteriores.
+  if (pending.length) {
+    const now = new Date();
+    pending.forEach((m) => shPar.getRange(m.row, 13).setValue(now));
+  }
+
+  // Crear las nuevas agrupaciones completas.
+  desiredGroups.forEach((group) => {
+    appendMatch_(shPar, fecha, turnoId, group);
+  });
+}
+
+/**
+ * Devuelve solicitudes activas ordenadas por fecha de solicitud.
+ */
+function getActivePlayers_(sh, fecha, turnoId) {
+  return getRows_(sh)
+    .filter((r) => r.ID_JUGADOR && r.ID_TURNO == turnoId && sameDate_(r.F_PARTIDO, fecha) && !r.F_ANULACION)
+    .sort((a, b) => new Date(a.F_SOLICITUD) - new Date(b.F_SOLICITUD));
+}
+
+/**
+ * Partidos pendientes y no borrados.
+ * Pendiente = los cuatro campos N_SET están vacíos.
+ */
+function getPendingMatches_(sh, fecha, turnoId) {
+  return getRows_(sh).filter((r) => r.ID_TURNO == turnoId && sameDate_(r.F_PARTIDO, fecha) && !r.F_BORRADO && isBlank_(r.N_SET_J1) && isBlank_(r.N_SET_J2) && isBlank_(r.N_SET_J3) && isBlank_(r.N_SET_J4));
+}
+
+function appendMatch_(sh, fecha, turnoId, group) {
+  if (group.length !== 4) {
+    return;
+  }
+
+  const temporada = getTemporadaByDate_(fecha);
+
+  if (!temporada) {
+    throw new Error("No existe una temporada para la fecha del partido: " + formatDateApi_(fecha));
+  }
+
+  const id = nextId_(sh, 1);
+
+  sh.appendRow([id, temporada.id, turnoId, fecha, group[0], group[1], group[2], group[3], "", "", "", "", ""]);
+}
+
+function getTemporadaByDate_(fecha) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEETS.TEMPORADAS);
+
+  const fechaPartido = normalizeDate_(fecha);
+
+  if (!fechaPartido) {
+    return null;
+  }
+
+  const temporada = getRows_(sh).find((t) => {
+    const inicio = normalizeDate_(t.F_INICIO);
+
+    const fin = normalizeDate_(t.F_FIN);
+
+    if (!inicio || !fin) {
+      return false;
+    }
+
+    return fechaPartido.getTime() >= inicio.getTime() && fechaPartido.getTime() <= fin.getTime();
+  });
+
+  if (!temporada) {
+    return null;
+  }
+
+  return {
+    id: Number(temporada.ID_TEMPORADA),
+
+    nombre: temporada.NOMBRE,
+
+    fechaInicio: formatDateApi_(temporada.F_INICIO),
+
+    fechaFin: formatDateApi_(temporada.F_FIN),
+
+    numMaxPartidos: Number(temporada.NUM_MAX_PARTIDOS),
+  };
+}
+
+function createRequestIfNeeded_(playerId, fecha, turnoId, observaciones) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEETS.SOLICITUDES);
+  const rows = getRows_(sh);
+  const exists = rows.some((r) => r.ID_JUGADOR == playerId && r.ID_TURNO == turnoId && sameDate_(r.F_PARTIDO, fecha) && !r.F_ANULACION);
+  if (exists) return;
+
+  sh.appendRow([nextId_(sh, 1), playerId, turnoId, fecha, new Date(), "", observaciones]);
+}
+
+function cancelRequest_(playerId, fecha, turnoId) {
+  console.log("cancelRequest_");
+
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEETS.SOLICITUDES);
+  const rows = getRows_(sh);
+  const candidates = rows
+    .map((r, i) => ({ ...r, row: i + 2 }))
+    .filter((r) => {
+      /*console.log("-------------------------------");
+      console.log("r.ID_JUGADOR: " + r.ID_JUGADOR);
+      console.log("playerId: " + playerId);
+      console.log("r.ID_TURNO: " + r.ID_TURNO);
+      console.log("turnoId: " + turnoId);
+      console.log("r.F_SOLICITUD: " + r.F_SOLICITUD);
+      console.log("fecha: " + fecha);
+      console.log("r.F_ANULACION: " + r.F_ANULACION);
+      console.log("-------------------------------");*/
+
+      return r.ID_JUGADOR == playerId && r.ID_TURNO == turnoId && sameDate_(r.F_PARTIDO, fecha) && !r.F_ANULACION;
+    })
+    .sort((a, b) => new Date(b.F_SOLICITUD) - new Date(a.F_SOLICITUD));
+
+  console.log("candidates.length: " + candidates.length);
+
+  if (!candidates.length) return;
+
+  console.log("estamos por aqui");
+  sh.getRange(candidates[0].row, 6).setValue(new Date());
+}
+
+function findPlayerByEmail_(email) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEETS.JUGADORES);
+  /*return getRows_(sh).find(r =>
+    String(r.CORREO || '').trim().toLowerCase() === email
+  ) || null;*/
+  const row = getRows_(sh).find(
+    (r) =>
+      String(r.CORREO || "")
+        .trim()
+        .toLowerCase() === email,
+  );
+  return row ? Number(row.ID_JUGADOR) : null;
+}
+
+function getTurnId_(turno) {
+  const text = String(turno || "")
+    .trim()
+    .toLowerCase();
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEETS.TURNOS);
+  const row = getRows_(sh).find(
+    (r) =>
+      String(r.TURNO || "")
+        .trim()
+        .toLowerCase() === text,
+  );
+  return row ? Number(row.ID_TURNO) : null;
+}
+
+function getFormData_(e) {
+  const nv = e.namedValues || {};
+  const get = (names) => {
+    for (const n of names) {
+      if (nv[n] && nv[n][0] != null) return nv[n][0];
+    }
+    // búsqueda tolerante a mayúsculas/acentos
+    const wanted = names.map(normalizeText_);
+    for (const key in nv) {
+      if (wanted.includes(normalizeText_(key))) return nv[key][0];
+    }
+    return "";
+  };
+
+  // La pregunta de email puede aparecer como "Dirección de correo electrónico".
+  let email = "";
+  for (const key in nv) {
+    const k = normalizeText_(key);
+    if (k.includes("correo") || k.includes("email")) {
+      email = nv[key][0];
+      break;
+    }
+  }
+
+  return {
+    email,
+    accion: get(CFG.FORM_FIELDS.ACCION),
+    fecha: get(CFG.FORM_FIELDS.FECHA),
+    turno: get(CFG.FORM_FIELDS.TURNO),
+    observaciones: get(CFG.FORM_FIELDS.OBSERVACIONES),
+  };
+}
+
+function getRows_(sh) {
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const headers = values[0].map(String);
+  return values.slice(1).map((row, idx) => {
+    const obj = { row: idx + 2 };
+    headers.forEach((h, i) => (obj[h] = row[i]));
+    return obj;
+  });
+}
+
+function nextId_(sh, col) {
+  const last = sh.getLastRow();
+  if (last < 2) return 1;
+  const vals = sh
+    .getRange(2, col, last - 1, 1)
+    .getValues()
+    .flat()
+    .map(Number)
+    .filter((n) => !isNaN(n) && n > 0);
+  return vals.length ? Math.max(...vals) + 1 : 1;
+}
+
+function sameGroups_(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].length !== b[i].length) return false;
+    for (let j = 0; j < a[i].length; j++) {
+      if (Number(a[i][j]) !== Number(b[i][j])) return false;
+    }
+  }
+  return true;
+}
+
+function normalizeDate_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value)) {
+    return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+  }
+  const s = String(value || "").trim();
+  if (!s) return null;
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  const d = new Date(s);
+  return isNaN(d) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function sameDate_(a, b) {
+  const da = normalizeDate_(a);
+  const db = normalizeDate_(b);
+  return da && db && da.getTime() === db.getTime();
+}
+
+function key_(fecha, turno) {
+  return normalizeDate_(fecha).getTime() + "|" + turno;
+}
+
+function isBlank_(v) {
+  return v === "" || v === null || typeof v === "undefined";
+}
+
+function normalizeText_(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
+/*************************************************
+ * API WEB - LIGA DE PÁDEL
+ *************************************************/
+
+function doGet(e) {
+  const action = String((e && e.parameter && e.parameter.action) || "").toLowerCase();
+
+  try {
+    let data;
+
+    switch (action) {
+      case "partidos":
+        data = apiGetPartidos_(e);
+        break;
+
+      case "solicitudes":
+        data = apiGetSolicitudes_();
+        break;
+
+      case "clasificacion":
+        data = apiGetClasificacion_(e);
+        break;
+
+      case "temporadas":
+        data = apiGetTemporadas_();
+        break;
+
+      case "resumen":
+        data = apiGetResumen_();
+        break;
+
+      case "resultados":
+        data = apiGetResultados_(e);
+        break;
+
+      default:
+        data = {
+          error: true,
+          message: "Acción no válida",
+        };
+    }
+
+    return jsonResponse_(data);
+  } catch (error) {
+    console.error(error);
+
+    return jsonResponse_({
+      error: true,
+      message: error.message,
+    });
+  }
+}
+
+function jsonResponse_(data) {
+  return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
+}
+
+//Endpoint1: Próximos partidos
+
+function apiGetPartidos_(e) {
+  const ss = SpreadsheetApp.getActive();
+
+  const shPartidos = ss.getSheetByName(CFG.SHEETS.PARTIDOS);
+
+  const shJugadores = ss.getSheetByName(CFG.SHEETS.JUGADORES);
+
+  const shTurnos = ss.getSheetByName(CFG.SHEETS.TURNOS);
+
+  const jugadores = getRows_(shJugadores);
+
+  const turnos = getRows_(shTurnos);
+
+  const jugadoresMap = {};
+
+  jugadores.forEach((jugador) => {
+    jugadoresMap[Number(jugador.ID_JUGADOR)] = {
+      id: Number(jugador.ID_JUGADOR),
+      nombre: jugador.NOMBRE,
+    };
+  });
+
+  const turnosMap = {};
+
+  turnos.forEach((turno) => {
+    turnosMap[Number(turno.ID_TURNO)] = turno.TURNO;
+  });
+
+  const temporadasData = apiGetTemporadas_();
+  const idTemporadaParam = e && e.parameter && e.parameter.idTemporada ? Number(e.parameter.idTemporada) : null;
+  const temporada = idTemporadaParam ? temporadasData.temporadas.find((item) => item.id === idTemporadaParam) : temporadasData.temporadaActual;
+
+  if (!temporada) {
+    return {
+      action: "partidos",
+      temporada: null,
+      total: 0,
+      partidos: [],
+    };
+  }
+
+  const partidos = getRows_(shPartidos)
+    .filter((partido) => {
+      return !partido.F_BORRADO && Number(partido.ID_TEMPORADA) === temporada.id && isBlank_(partido.N_SET_J1) && isBlank_(partido.N_SET_J2) && isBlank_(partido.N_SET_J3) && isBlank_(partido.N_SET_J4);
+    })
+
+    .map((partido) => {
+      return {
+        idPartido: Number(partido.ID_PARTIDO),
+
+        fecha: formatDateApi_(partido.F_PARTIDO),
+
+        turno: {
+          id: Number(partido.ID_TURNO),
+          nombre: turnosMap[Number(partido.ID_TURNO)],
+        },
+
+        jugadores: [jugadoresMap[Number(partido.ID_JUGADOR1)], jugadoresMap[Number(partido.ID_JUGADOR2)], jugadoresMap[Number(partido.ID_JUGADOR3)], jugadoresMap[Number(partido.ID_JUGADOR4)]],
+      };
+    });
+
+  partidos.sort((a, b) => {
+    const fechaA = new Date(a.fecha);
+    const fechaB = new Date(b.fecha);
+
+    if (fechaA.getTime() !== fechaB.getTime()) {
+      return fechaA - fechaB;
+    }
+
+    return a.turno.id - b.turno.id;
+  });
+
+  return {
+    action: "partidos",
+    temporada: temporada,
+    total: partidos.length,
+    partidos: partidos,
+  };
+}
+
+//Endpoint 2: solicitudes activas
+
+function apiGetSolicitudes_() {
+  const ss = SpreadsheetApp.getActive();
+
+  const shSolicitudes = ss.getSheetByName(CFG.SHEETS.SOLICITUDES);
+
+  const shJugadores = ss.getSheetByName(CFG.SHEETS.JUGADORES);
+
+  const shTurnos = ss.getSheetByName(CFG.SHEETS.TURNOS);
+
+  const shPartidos = ss.getSheetByName(CFG.SHEETS.PARTIDOS);
+
+  /****************************************
+   * MAPA DE JUGADORES
+   ****************************************/
+
+  const jugadoresMap = {};
+
+  getRows_(shJugadores).forEach((jugador) => {
+    jugadoresMap[Number(jugador.ID_JUGADOR)] = jugador.NOMBRE;
+  });
+
+  /****************************************
+   * MAPA DE TURNOS
+   ****************************************/
+
+  const turnosMap = {};
+
+  getRows_(shTurnos).forEach((turno) => {
+    turnosMap[Number(turno.ID_TURNO)] = turno.TURNO;
+  });
+
+  const hoy = today_();
+
+  /****************************************
+   * SOLICITUDES ACTIVAS
+   ****************************************/
+
+  const solicitudes = getRows_(shSolicitudes)
+    .filter((solicitud) => {
+      return !solicitud.F_ANULACION && sameOrAfterToday_(solicitud.F_PARTIDO, hoy);
+    })
+
+    .sort((a, b) => {
+      const fechaA = normalizeDate_(a.F_PARTIDO);
+
+      const fechaB = normalizeDate_(b.F_PARTIDO);
+
+      // Primero fecha
+
+      if (fechaA.getTime() !== fechaB.getTime()) {
+        return fechaA - fechaB;
+      }
+
+      // Después turno
+
+      if (Number(a.ID_TURNO) !== Number(b.ID_TURNO)) {
+        return Number(a.ID_TURNO) - Number(b.ID_TURNO);
+      }
+
+      // Finalmente fecha de solicitud
+
+      return new Date(a.F_SOLICITUD) - new Date(b.F_SOLICITUD);
+    });
+
+  /****************************************
+   * PARTIDOS ACTIVOS
+   *
+   * Solo partidos:
+   *
+   * - No borrados
+   * - Fecha >= hoy
+   ****************************************/
+
+  const partidos = getRows_(shPartidos).filter((partido) => {
+    return !partido.F_BORRADO && sameOrAfterToday_(partido.F_PARTIDO, hoy);
+  });
+
+  /****************************************
+   * MAPA:
+   *
+   * fecha + turno + jugador
+   *
+   * → idPartido
+   ****************************************/
+
+  const jugadoresEnPartido = {};
+
+  partidos.forEach((partido) => {
+    const fecha = formatDateApi_(partido.F_PARTIDO);
+
+    const turno = Number(partido.ID_TURNO);
+
+    const jugadores = [Number(partido.ID_JUGADOR1), Number(partido.ID_JUGADOR2), Number(partido.ID_JUGADOR3), Number(partido.ID_JUGADOR4)];
+
+    jugadores.forEach((idJugador) => {
+      if (!idJugador) {
+        return;
+      }
+
+      const key = fecha + "_" + turno + "_" + idJugador;
+
+      jugadoresEnPartido[key] = Number(partido.ID_PARTIDO);
+    });
+  });
+
+  /****************************************
+   * AGRUPAMOS SOLICITUDES
+   *
+   * POR FECHA + TURNO
+   ****************************************/
+
+  const grupos = {};
+
+  solicitudes.forEach((solicitud, index) => {
+    const fecha = formatDateApi_(solicitud.F_PARTIDO);
+
+    const turnoId = Number(solicitud.ID_TURNO);
+
+    const jugadorId = Number(solicitud.ID_JUGADOR);
+
+    const keyGrupo = fecha + "_" + turnoId;
+
+    if (!grupos[keyGrupo]) {
+      grupos[keyGrupo] = {
+        fecha: fecha,
+
+        turno: {
+          id: turnoId,
+
+          nombre: turnosMap[turnoId],
+        },
+
+        jugadores: [],
+      };
+    }
+
+    const keyJugador = fecha + "_" + turnoId + "_" + jugadorId;
+
+    const idPartido = jugadoresEnPartido[keyJugador] || null;
+
+    grupos[keyGrupo].jugadores.push({
+      id: jugadorId,
+
+      nombre: jugadoresMap[jugadorId],
+
+      fechaSolicitud: formatDateTimeApi_(solicitud.F_SOLICITUD),
+
+      observaciones: solicitud.OBSERVACIONES || "",
+
+      // Posición real
+      // según orden de solicitud
+
+      posicion: grupos[keyGrupo].jugadores.length + 1,
+
+      // El backend decide
+
+      estado: idPartido ? "PARTIDO" : "ESPERA",
+
+      idPartido: idPartido,
+    });
+  });
+
+  /****************************************
+   * CONVERTIMOS EL OBJETO
+   * EN ARRAY
+   ****************************************/
+
+  const resultado = Object.values(grupos);
+
+  return {
+    action: "solicitudes",
+
+    total: solicitudes.length,
+
+    solicitudes: resultado,
+  };
+}
+
+//Endpoint 3: clasificación
+function apiGetClasificacion_(e) {
+  const ss = SpreadsheetApp.getActive();
+
+  const shJugadores = ss.getSheetByName(CFG.SHEETS.JUGADORES);
+
+  const shPartidos = ss.getSheetByName(CFG.SHEETS.PARTIDOS);
+
+  const temporadasData = apiGetTemporadas_();
+
+  /****************************************
+   * TEMPORADA SELECCIONADA
+   ****************************************/
+
+  const idTemporadaParam = e && e.parameter && e.parameter.idTemporada ? Number(e.parameter.idTemporada) : null;
+
+  let temporada;
+
+  if (idTemporadaParam) {
+    temporada = temporadasData.temporadas.find((t) => t.id === idTemporadaParam);
+  } else {
+    temporada = temporadasData.temporadaActual;
+  }
+
+  if (!temporada) {
+    return {
+      action: "clasificacion",
+
+      temporada: null,
+
+      total: 0,
+
+      clasificacion: [],
+    };
+  }
+
+  /****************************************
+   * MAPA DE JUGADORES
+   ****************************************/
+
+  const ranking = {};
+
+  getRows_(shJugadores).forEach((jugador) => {
+    const id = Number(jugador.ID_JUGADOR);
+
+    ranking[id] = {
+      id: id,
+
+      nombre: jugador.NOMBRE,
+
+      partidosJugados: 0,
+
+      setsGanados: 0,
+    };
+  });
+
+  /****************************************
+   * PARTIDOS VÁLIDOS
+   *
+   * - De la temporada
+   * - No borrados
+   * - Finalizados
+   ****************************************/
+
+  const partidos = getRows_(shPartidos)
+    .filter((partido) => {
+      return Number(partido.ID_TEMPORADA) === temporada.id && !partido.F_BORRADO && !isBlank_(partido.N_SET_J1) && !isBlank_(partido.N_SET_J2) && !isBlank_(partido.N_SET_J3) && !isBlank_(partido.N_SET_J4);
+    })
+
+    .sort((a, b) => {
+      const fechaA = normalizeDate_(a.F_PARTIDO);
+
+      const fechaB = normalizeDate_(b.F_PARTIDO);
+
+      if (fechaA.getTime() !== fechaB.getTime()) {
+        return fechaA - fechaB;
+      }
+
+      return Number(a.ID_PARTIDO) - Number(b.ID_PARTIDO);
+    });
+
+  /****************************************
+   * PARTIDOS POR JUGADOR
+   ****************************************/
+
+  const partidosPorJugador = {};
+
+  Object.keys(ranking)
+
+    .forEach((id) => {
+      partidosPorJugador[id] = [];
+    });
+
+  partidos.forEach((partido) => {
+    const jugadores = [
+      {
+        id: Number(partido.ID_JUGADOR1),
+
+        sets: Number(partido.N_SET_J1),
+      },
+
+      {
+        id: Number(partido.ID_JUGADOR2),
+
+        sets: Number(partido.N_SET_J2),
+      },
+
+      {
+        id: Number(partido.ID_JUGADOR3),
+
+        sets: Number(partido.N_SET_J3),
+      },
+
+      {
+        id: Number(partido.ID_JUGADOR4),
+
+        sets: Number(partido.N_SET_J4),
+      },
+    ];
+
+    jugadores.forEach((jugador) => {
+      if (!partidosPorJugador[jugador.id]) {
+        return;
+      }
+
+      partidosPorJugador[jugador.id].push({
+        idPartido: Number(partido.ID_PARTIDO),
+
+        fecha: formatDateApi_(partido.F_PARTIDO),
+
+        sets: jugador.sets,
+      });
+    });
+  });
+
+  /****************************************
+   * COMPUTAR SOLO LOS PRIMEROS
+   * NUM_MAX_PARTIDOS
+   ****************************************/
+
+  Object.keys(partidosPorJugador)
+
+    .forEach((id) => {
+      const partidosJugador = partidosPorJugador[id].slice(0, temporada.numMaxPartidos);
+
+      ranking[id].partidosJugados = partidosJugador.length;
+
+      ranking[id].setsGanados = partidosJugador.reduce(
+        (total, partido) => total + partido.sets,
+
+        0,
+      );
+    });
+
+  /****************************************
+   * CLASIFICACIÓN
+   ****************************************/
+
+  const clasificacion = Object.values(ranking)
+
+    .filter((jugador) => jugador.partidosJugados > 0)
+
+    .sort((a, b) => {
+      /*************************
+       * 1. SETS GANADOS
+       *************************/
+
+      if (b.setsGanados !== a.setsGanados) {
+        return b.setsGanados - a.setsGanados;
+      }
+
+      /*************************
+       * 2. PARTIDOS JUGADOS
+       *************************/
+
+      if (b.partidosJugados !== a.partidosJugados) {
+        return b.partidosJugados - a.partidosJugados;
+      }
+
+      /*************************
+       * 3. NOMBRE
+       *************************/
+
+      return a.nombre.localeCompare(b.nombre);
+    });
+
+  clasificacion.forEach((jugador, index) => {
+    jugador.posicion = index + 1;
+  });
+
+  return {
+    action: "clasificacion",
+
+    temporada: temporada,
+
+    total: clasificacion.length,
+
+    clasificacion: clasificacion,
+  };
+}
+
+//EndPoint: temporadas
+function apiGetTemporadas_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEETS.TEMPORADAS);
+
+  const hoy = today_();
+
+  const temporadas = getRows_(sh)
+    .filter((temporada) => temporada.ID_TEMPORADA)
+
+    .map((temporada) => {
+      const inicio = normalizeDate_(temporada.F_INICIO);
+
+      const fin = normalizeDate_(temporada.F_FIN);
+
+      return {
+        id: Number(temporada.ID_TEMPORADA),
+
+        nombre: temporada.NOMBRE,
+
+        fechaInicio: formatDateApi_(inicio),
+
+        fechaFin: formatDateApi_(fin),
+
+        numMaxPartidos: Number(temporada.NUM_MAX_PARTIDOS),
+
+        actual: inicio && fin && hoy.getTime() >= inicio.getTime() && hoy.getTime() <= fin.getTime(),
+      };
+    })
+
+    .sort((a, b) => new Date(b.fechaInicio) - new Date(a.fechaInicio));
+
+  const temporadaActual = temporadas.find((temporada) => temporada.actual) || null;
+
+  return {
+    action: "temporadas",
+
+    total: temporadas.length,
+
+    temporadaActual: temporadaActual,
+
+    temporadas: temporadas,
+  };
+}
+
+//Endpoint: resultados
+function apiGetResultados_(e) {
+  const ss = SpreadsheetApp.getActive();
+
+  const shPartidos = ss.getSheetByName(CFG.SHEETS.PARTIDOS);
+
+  const shJugadores = ss.getSheetByName(CFG.SHEETS.JUGADORES);
+
+  const shTurnos = ss.getSheetByName(CFG.SHEETS.TURNOS);
+
+  const temporadasData = apiGetTemporadas_();
+
+  const idTemporadaParam = e && e.parameter && e.parameter.idTemporada ? Number(e.parameter.idTemporada) : null;
+
+  let temporada;
+
+  if (idTemporadaParam) {
+    temporada = temporadasData.temporadas.find((t) => t.id === idTemporadaParam);
+  } else {
+    temporada = temporadasData.temporadaActual;
+  }
+
+  if (!temporada) {
+    return {
+      action: "resultados",
+
+      temporada: null,
+
+      total: 0,
+
+      partidos: [],
+    };
+  }
+
+  const jugadoresMap = {};
+
+  getRows_(shJugadores).forEach((jugador) => {
+    jugadoresMap[Number(jugador.ID_JUGADOR)] = jugador.NOMBRE;
+  });
+
+  const turnosMap = {};
+
+  getRows_(shTurnos).forEach((turno) => {
+    turnosMap[Number(turno.ID_TURNO)] = turno.TURNO;
+  });
+
+  const partidos = getRows_(shPartidos)
+    .filter((partido) => {
+      return Number(partido.ID_TEMPORADA) === temporada.id && !partido.F_BORRADO && !isBlank_(partido.N_SET_J1) && !isBlank_(partido.N_SET_J2) && !isBlank_(partido.N_SET_J3) && !isBlank_(partido.N_SET_J4);
+    })
+
+    .map((partido) => ({
+      idPartido: Number(partido.ID_PARTIDO),
+
+      fecha: formatDateApi_(partido.F_PARTIDO),
+
+      turno: {
+        id: Number(partido.ID_TURNO),
+
+        nombre: turnosMap[Number(partido.ID_TURNO)],
+      },
+
+      jugadores: [
+        {
+          id: Number(partido.ID_JUGADOR1),
+
+          nombre: jugadoresMap[Number(partido.ID_JUGADOR1)],
+
+          setsGanados: Number(partido.N_SET_J1),
+        },
+
+        {
+          id: Number(partido.ID_JUGADOR2),
+
+          nombre: jugadoresMap[Number(partido.ID_JUGADOR2)],
+
+          setsGanados: Number(partido.N_SET_J2),
+        },
+
+        {
+          id: Number(partido.ID_JUGADOR3),
+
+          nombre: jugadoresMap[Number(partido.ID_JUGADOR3)],
+
+          setsGanados: Number(partido.N_SET_J3),
+        },
+
+        {
+          id: Number(partido.ID_JUGADOR4),
+
+          nombre: jugadoresMap[Number(partido.ID_JUGADOR4)],
+
+          setsGanados: Number(partido.N_SET_J4),
+        },
+      ],
+    }))
+
+    .sort((a, b) => {
+      const fechaA = new Date(a.fecha);
+
+      const fechaB = new Date(b.fecha);
+
+      if (fechaA.getTime() !== fechaB.getTime()) {
+        return fechaB - fechaA;
+      }
+
+      return a.turno.id - b.turno.id;
+    });
+
+  return {
+    action: "resultados",
+
+    temporada: temporada,
+
+    total: partidos.length,
+
+    partidos: partidos,
+  };
+}
+
+//Endpoint 4: resumen
+function apiGetResumen_() {
+  const partidos = apiGetPartidos_();
+
+  const solicitudes = apiGetSolicitudes_();
+
+  const clasificacion = apiGetClasificacion_();
+
+  return {
+    action: "resumen",
+
+    proximosPartidos: partidos.total,
+
+    solicitudesActivas: solicitudes.total,
+
+    jugadoresClasificados: clasificacion.total,
+
+    lider: clasificacion.clasificacion.length ? clasificacion.clasificacion[0] : null,
+  };
+}
+
+//Funciones auxiliares API
+function today_() {
+  const now = new Date();
+
+  return new Date(
+    now.getFullYear(),
+
+    now.getMonth(),
+
+    now.getDate(),
+  );
+}
+
+function sameOrAfterToday_(fecha, hoy) {
+  const fechaNormalizada = normalizeDate_(fecha);
+
+  return fechaNormalizada && fechaNormalizada.getTime() >= hoy.getTime();
+}
+
+function formatDateApi_(date) {
+  const d = normalizeDate_(date);
+
+  if (!d) {
+    return null;
+  }
+
+  return Utilities.formatDate(
+    d,
+
+    Session.getScriptTimeZone(),
+
+    "yyyy-MM-dd",
+  );
+}
+
+function formatDateTimeApi_(date) {
+  if (!date) {
+    return null;
+  }
+
+  const d = new Date(date);
+
+  return Utilities.formatDate(
+    d,
+
+    Session.getScriptTimeZone(),
+
+    "yyyy-MM-dd'T'HH:mm:ss",
+  );
+}
